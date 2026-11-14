@@ -1,0 +1,24 @@
+Test accuracy: 0.665 (66.5%)
+Macro F1:      0.640
+
+              precision    recall  f1-score   support
+
+       angry      0.606     0.565     0.585       958
+     disgust      0.595     0.676     0.633       111
+        fear      0.562     0.365     0.443      1024
+       happy      0.877     0.870     0.874      1774
+     neutral      0.549     0.737     0.629      1233
+         sad      0.563     0.517     0.539      1247
+    surprise      0.736     0.826     0.778       831
+
+    accuracy                          0.665      7178
+   macro avg      0.641     0.651     0.640      7178
+weighted avg      0.664     0.665     0.659      7178
+
+Most common mistakes:
+  sad       -> neutral    315 images (25% of all 'sad' faces)
+  fear      -> sad        206 images (20% of all 'fear' faces)
+  fear      -> neutral    161 images (16% of all 'fear' faces)
+  neutral   -> sad        144 images (12% of all 'neutral' faces)
+  angry     -> neutral    142 images (15% of all 'angry' faces)
+  fear      -> surprise   120 images (12% of all 'fear' faces)

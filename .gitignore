@@ -1,0 +1,8 @@
+data/
+*.pt
+__pycache__/
+.DS_Store
+.venv/
+!models/expression_cnn.pt
+assets/debug/
+.vscode/
