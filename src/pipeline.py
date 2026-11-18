@@ -14,11 +14,13 @@ from src.expression_recognizer import (
 )
 from src.object_detector import ObjectDetector, draw_detections
 from src.position import locate
+from src.proximity import VERY_CLOSE, HazardWarner, find_hazards
 from src.speech import Speaker
 from src.text_reader import TextLine, TextReader, draw_text_boxes, speakable_text
 
 FACE_GONE_RUNS = 15           # analyses without a face before the face is "forgotten"
 ON_DEMAND_BOX_SECONDS = 4.0   # how long boxes from "read text now" stay on screen
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 @dataclass
@@ -37,6 +39,11 @@ class VisionPipeline:
             min_consecutive=config.OBJECT_MIN_CONSECUTIVE,
             max_objects_per_message=config.MAX_OBJECTS_PER_MESSAGE,
         )
+        self.hazard_warner = HazardWarner(
+            self.speaker,
+            cooldown=config.PROXIMITY_COOLDOWN,
+            min_consecutive=config.PROXIMITY_MIN_CONSECUTIVE,
+        )
         self.detector = ObjectDetector(model_name=config.YOLO_MODEL,
                                        confidence=config.YOLO_CONFIDENCE)
         self.reader = TextReader(min_confidence=config.OCR_MIN_CONFIDENCE,
@@ -51,12 +58,13 @@ class VisionPipeline:
             self.warnings.append(f"Facial expression recognition is unavailable: {error}")
 
         self.objects_enabled = False
+        self.near_enabled = False
         self.text_enabled = False
         self.expression_enabled = False
         self.stats = {}   # last run time of each feature, in milliseconds
 
         self._last_run = {"objects": 0.0, "text": 0.0, "expression": 0.0}
-        self._detections, self._positioned = [], []
+        self._detections, self._positioned, self._hazards = [], [], []
         self._text_lines, self._text_lines_until = [], 0.0
         self._spoken_texts = []   # (normalised text, time) of recently read text
         self._expression = None
@@ -68,14 +76,26 @@ class VisionPipeline:
     def expression_available(self):
         return self.recognizer is not None
 
-    def set_enabled(self, objects=None, text=None, expression=None):
+    def set_enabled(self, objects=None, text=None, expression=None, near=None):
         """Switch features on or off. Arguments left as None are unchanged."""
+        detection_was_on = self.objects_enabled or self.near_enabled
+
         if objects is not None and objects != self.objects_enabled:
             self.objects_enabled = objects
-            self._last_run["objects"] = 0.0
             if not objects:
-                self._detections, self._positioned = [], []
                 self.announcer.announce_objects([])   # forget "seen N times in a row"
+
+        if near is not None and near != self.near_enabled:
+            self.near_enabled = near
+            if not near:
+                self._hazards = []
+                self.hazard_warner.reset()
+
+        detection_is_on = self.objects_enabled or self.near_enabled
+        if detection_is_on and not detection_was_on:
+            self._last_run["objects"] = 0.0
+        if not detection_is_on:
+            self._detections, self._positioned = [], []
 
         if text is not None and text != self.text_enabled:
             self.text_enabled = text
@@ -94,7 +114,8 @@ class VisionPipeline:
         """Forget all history, e.g. when the camera is restarted."""
         self.speaker.stop()
         self.announcer.reset()
-        self._detections, self._positioned = [], []
+        self.hazard_warner.reset()
+        self._detections, self._positioned, self._hazards = [], [], []
         self._text_lines, self._text_lines_until = [], 0.0
         self._spoken_texts = []
         self._expression = None
@@ -116,6 +137,13 @@ class VisionPipeline:
         self._announced_expression = None
         self._face_missing = 0
 
+    def _disable(self, name):
+        if name == "objects":   # detection feeds both of these
+            self.objects_enabled = False
+            self.near_enabled = False
+        else:
+            setattr(self, f"{name}_enabled", False)
+
     # ---------------------------------------------------------- processing
 
     def process(self, frame):
@@ -125,7 +153,8 @@ class VisionPipeline:
         small, scale = self._shrink(frame)
 
         schedule = (
-            ("objects", self.objects_enabled, config.OBJECT_INTERVAL, self._update_objects),
+            ("objects", self.objects_enabled or self.near_enabled,
+             config.OBJECT_INTERVAL, self._update_objects),
             ("text", self.text_enabled, config.OCR_INTERVAL, self._update_text),
             ("expression", self.expression_enabled, config.EXPRESSION_INTERVAL,
              self._update_expression),
@@ -154,7 +183,7 @@ class VisionPipeline:
         try:
             update(small, frame, scale, events)
         except Exception as error:
-            setattr(self, f"{name}_enabled", False)
+            self._disable(name)
             events.append(f"Warning: {name} was switched off after an error: {error}")
             return
         self.stats[name] = (time.perf_counter() - start) * 1000
@@ -162,11 +191,31 @@ class VisionPipeline:
     # ------------------------------------------------------------ features
 
     def _update_objects(self, small, frame, scale, events):
+        height, width = small.shape[:2]
         self._detections = self.detector.detect(small)
-        self._positioned = locate(self._detections, small.shape[1])
-        message = self.announcer.announce_objects(self._positioned)
-        if message:
-            events.append(message)
+        self._positioned = locate(self._detections, width)
+
+        # Near warnings come first: they matter more than a list of objects.
+        if self.near_enabled:
+            self._hazards = find_hazards(
+                self._positioned, width, height,
+                close=config.PROXIMITY_CLOSE_RATIO,
+                very_close=config.PROXIMITY_VERY_CLOSE_RATIO,
+            )
+            warning = self.hazard_warner.update(self._hazards)
+            if warning:
+                events.append(warning)
+        else:
+            self._hazards = []
+
+        if self.objects_enabled:
+            # Close obstacles are covered by the warnings, so don't announce them twice.
+            handled = {(hazard.label, hazard.position) for hazard in self._hazards}
+            candidates = [item for item in self._positioned
+                          if (item.label, item.position) not in handled]
+            message = self.announcer.announce_objects(candidates)
+            if message:
+                events.append(message)
 
     def _update_text(self, small, frame, scale, events):
         lines = self.reader.read(frame)
@@ -242,11 +291,23 @@ class VisionPipeline:
         self._spoken_texts.append((" ".join(text.lower().split()), now))
 
     def _draw(self, small, now):
-        annotated = draw_detections(small, self._detections)
-        for item in self._positioned:
-            x1, _, _, y2 = item.detection.box
-            cv2.putText(annotated, item.position, (x1 + 4, y2 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        annotated = small.copy()
+
+        if self.objects_enabled:
+            annotated = draw_detections(annotated, self._detections)
+            for item in self._positioned:
+                x1, _, _, y2 = item.detection.box
+                cv2.putText(annotated, item.position, (x1 + 4, y2 - 8),
+                            FONT, 0.55, (0, 255, 255), 2)
+
+        if self.near_enabled:
+            for hazard in self._hazards:
+                color = (0, 0, 255) if hazard.level == VERY_CLOSE else (0, 140, 255)
+                x1, y1, x2, y2 = hazard.box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 4)
+                cv2.putText(annotated, f"{hazard.label.upper()} {hazard.level.upper()}",
+                            (x1 + 6, max(y1 + 24, 24)), FONT, 0.7, color, 2)
+
         if now < self._text_lines_until:
             annotated = draw_text_boxes(annotated, self._text_lines)
         return draw_expression(annotated, self._expression)
@@ -265,10 +326,10 @@ def _run_pipeline_test():
     pipeline = VisionPipeline()
     for warning in pipeline.warnings:
         print(f"Warning: {warning}")
-    pipeline.set_enabled(objects=True)
+    pipeline.set_enabled(objects=True, near=True)
 
-    print("Keys: 1 objects | 2 text | 3 expression | SPACE read text now | "
-          "x stop speech | q quit")
+    print("Keys: 1 objects | 2 text | 3 expression | 4 near warnings | "
+          "SPACE read text now | x stop speech | q quit")
 
     window_name = "VisionMate - pipeline test"
     fps, last_time = 0.0, time.time()
@@ -289,16 +350,16 @@ def _run_pipeline_test():
 
                 display = result.frame
                 hud = [
-                    f"[1] objects {_state(pipeline.objects_enabled)}   "
-                    f"[2] text {_state(pipeline.text_enabled)}   "
-                    f"[3] expression {_state(pipeline.expression_enabled)}",
+                    f"[1] objects {_state(pipeline.objects_enabled)}  "
+                    f"[2] text {_state(pipeline.text_enabled)}  "
+                    f"[3] expression {_state(pipeline.expression_enabled)}  "
+                    f"[4] near {_state(pipeline.near_enabled)}",
                     f"{fps:.0f} FPS | " + " ".join(
                         f"{name} {ms:.0f}ms" for name, ms in pipeline.stats.items())
                     + (" | speaking" if pipeline.speaker.is_speaking else " | silent"),
                 ]
                 for row, line in enumerate(hud):
-                    cv2.putText(display, line, (10, 22 + row * 22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(display, line, (10, 22 + row * 22), FONT, 0.5, (0, 255, 0), 1)
                 cv2.imshow(window_name, display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -313,6 +374,8 @@ def _run_pipeline_test():
                         pipeline.set_enabled(expression=not pipeline.expression_enabled)
                     else:
                         print("Expression recognition is unavailable (see warning above).")
+                elif key == ord("4"):
+                    pipeline.set_enabled(near=not pipeline.near_enabled)
                 elif key == 32:
                     try:
                         print(f"Read now: {pipeline.read_text_now(frame)}")

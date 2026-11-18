@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionMate - connection test</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px;
+         margin: 2rem auto; padding: 0 1rem; line-height: 1.4; }
+  input, button { font-size: 1rem; padding: 0.5rem 0.8rem; margin: 0.2rem 0.2rem 0.2rem 0; }
+  #status { font-weight: 600; margin: 1rem 0; }
+  .ok { color: #1a7f37; }
+  .bad { color: #b42318; }
+  pre { background: #f4f4f5; padding: 0.8rem; min-height: 8rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>VisionMate connection test</h1>
+<p>Open this page in <b>two browser tabs</b>, keep the same code in both, and press
+Connect in each. Then press "Send ping" in one tab and watch the other.</p>
+
+<label>Pairing code <input id="code" value="TEST01" maxlength="12"></label>
+<button id="connect">Connect</button>
+<button id="send" disabled>Send ping</button>
+<p id="status" class="bad">Not connected</p>
+<pre id="log"></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+const SUPABASE_URL = "https://nsfwjbossexjlnszfxbf.supabase.co";
+const SUPABASE_KEY =
+"sb_publishable_MFaHrxAEOz6dw7fE4TFbPg_Jyha-YR9";
+
+const codeInput = document.getElementById("code");
+const connectButton = document.getElementById("connect");
+const sendButton = document.getElementById("send");
+const statusElement = document.getElementById("status");
+const logElement = document.getElementById("log");
+
+let client = null;
+let channel = null;
+let counter = 0;
+
+function log(text) {
+  const time = new Date().toLocaleTimeString();
+  logElement.textContent = `${time}  ${text}\n` + logElement.textContent;
+}
+
+function setStatus(text, ok) {
+  statusElement.textContent = text;
+  statusElement.className = ok ? "ok" : "bad";
+}
+
+function connect() {
+  if (SUPABASE_URL.startsWith("PASTE") || SUPABASE_KEY.startsWith("PASTE")) {
+    setStatus("Paste your Supabase URL and public key into this file first.", false);
+    return;
+  }
+
+  const code = codeInput.value.trim().toUpperCase();
+  if (!/^[A-Z0-9]{4,12}$/.test(code)) {
+    setStatus("Use 4 to 12 letters or digits for the code.", false);
+    return;
+  }
+
+  if (channel) {
+    client.removeChannel(channel);
+    channel = null;
+  }
+  if (!client) {
+    client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  }
+
+  setStatus("Connecting...", false);
+  sendButton.disabled = true;
+
+  channel = client.channel(`visionmate-${code}`, {
+    config: { broadcast: { self: false } },
+  });
+
+  channel.on("broadcast", { event: "ping" }, ({ payload }) => {
+    const delay = Date.now() - payload.sentAt;
+    log(`received ping #${payload.number} (about ${delay} ms, meaningful only between tabs on one computer)`);
+  });
+
+  channel.subscribe((state,error) => {
+    if (state === "SUBSCRIBED") {
+      setStatus(`Connected to channel ${code}`, true);
+      sendButton.disabled = false;
+    } else if (state === "CHANNEL_ERROR" || state === "TIMED_OUT") {
+      const reason = error && error.message ? error.message : "no details from the server";
+      setStatus(`Connection problem: ${state} (${reason})`, false);
+      console.error("Realtime error:", state, error);
+      sendButton.disabled = true;
+    } else if (state === "CLOSED") {
+      setStatus("Disconnected", false);
+      sendButton.disabled = true;
+    }
+  });
+}
+
+async function sendPing() {
+  if (!channel) return;
+  counter += 1;
+  const result = await channel.send({
+    type: "broadcast",
+    event: "ping",
+    payload: { number: counter, sentAt: Date.now() },
+  });
+  log(result === "ok" ? `sent ping #${counter}` : `send failed: ${result}`);
+}
+
+connectButton.addEventListener("click", connect);
+sendButton.addEventListener("click", sendPing);
+</script>
+</body>
+</html>

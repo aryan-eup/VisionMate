@@ -10,10 +10,12 @@ from src.camera import Camera, CameraError
 from src.pipeline import VisionPipeline
 
 FEATURES = (
+    ("near", "Near warnings"),
     ("objects", "Object detection + position"),
     ("text", "Text reading (OCR)"),
     ("expression", "Facial expression"),
 )
+DEFAULT_ON = {"near"}   # safety feature: on as soon as the page opens
 MAX_LOG_LINES = 10
 
 st.set_page_config(page_title="VisionMate", page_icon="👁️", layout="wide")
@@ -30,7 +32,7 @@ def init_state():
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
     for name, _ in FEATURES:
-        st.session_state.setdefault(f"{name}_on", False)
+        st.session_state.setdefault(f"{name}_on", name in DEFAULT_ON)
 
     # Features the pipeline switched off after an error: untick their boxes.
     # This must happen before the checkboxes are created.
@@ -120,7 +122,8 @@ init_state()
 pipeline = load_pipeline()
 
 st.title("VisionMate")
-st.caption("An AI visual assistant: it watches through the camera and speaks what it sees.")
+st.caption("See. Warn. Call for help. An AI visual assistant that watches through "
+           "the camera and speaks what it sees.")
 
 for warning in pipeline.warnings:
     st.warning(warning)
@@ -138,7 +141,12 @@ with st.sidebar:
         st.button("Start camera", on_click=start_camera, args=(pipeline,), type="primary")
 
     st.subheader("Features")
-    st.checkbox("Object detection + position", key="objects_on")
+    st.checkbox("Near warnings", key="near_on",
+                help="Warns when an obstacle looks close. This is an approximation "
+                     "from how large the object appears, not true depth.")
+    st.checkbox("Object detection + position", key="objects_on",
+                help="Announces what it sees and whether it is on the left, "
+                     "in the centre or on the right.")
     st.checkbox("Text reading (OCR)", key="text_on",
                 help="Reads printed text it sees. Use 'Read text now' to read on demand.")
     st.checkbox("Facial expression", key="expression_on",
@@ -157,6 +165,7 @@ with st.sidebar:
     )
 
 pipeline.set_enabled(
+    near=st.session_state.near_on,
     objects=st.session_state.objects_on,
     text=st.session_state.text_on,
     expression=st.session_state.expression_on,
